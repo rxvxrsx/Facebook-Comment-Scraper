@@ -1,5 +1,17 @@
 // sidepanel.js - Script for native Chrome Side Panel interface
 
+const {
+  DEFAULT_EXPORT_FIELD_KEYS,
+  EXPORT_FIELDS,
+  buildCsvTable,
+  buildJsonTree,
+  normalizeFieldKeys
+} = globalThis.FbExportCore;
+const {
+  SCRAPE_OPTIONS_STORAGE_KEY,
+  normalizeScrapeOptions
+} = globalThis.FbScraperCore;
+
 let activeTabId = null;
 let scrapeTabId = null;
 let currentRunId = null;
@@ -7,6 +19,7 @@ let isScraping = false;
 let hasSelectedPost = false;
 let scrapedComments = [];
 let totalCommentsCount = 0;
+let isPreviewLocked = false;
 const MAX_PREVIEW_COMMENTS = 200;
 
 // DOM References
@@ -21,6 +34,7 @@ const logMonitor = document.getElementById('log-monitor');
 const btnClearLog = document.getElementById('btn-clear-log');
 const previewList = document.getElementById('preview-list');
 const scrapingIndicator = document.getElementById('scraping-indicator');
+const btnLockPreview = document.getElementById('btn-lock-preview');
 
 const statTotal = document.getElementById('stat-total');
 const statComments = document.getElementById('stat-comments');
@@ -31,6 +45,14 @@ const optExpand = document.getElementById('opt-expand');
 const optImages = document.getElementById('opt-images');
 const optLimit = document.getElementById('opt-limit');
 const optDelay = document.getElementById('opt-delay');
+const exportFieldInputs = Array.from(document.querySelectorAll('.export-field'));
+const exportFieldCount = document.getElementById('export-field-count');
+const exportFieldsPanel = document.getElementById('export-fields-panel');
+const exportFieldChevron = document.getElementById('export-field-chevron');
+const btnToggleFields = document.getElementById('btn-toggle-fields');
+const btnFieldsAll = document.getElementById('btn-fields-all');
+const btnFieldsDefault = document.getElementById('btn-fields-default');
+const EXPORT_FIELDS_STORAGE_KEY = 'fbScraperExportFields';
 
 // Helper: Add log entry
 function addLog(message) {
@@ -75,25 +97,119 @@ function setOptionsDisabled(disabled) {
   });
 }
 
+function getCurrentScrapeOptions() {
+  return normalizeScrapeOptions({
+    expandReplies: optExpand.checked,
+    includeImages: optImages.checked,
+    limit: optLimit.value,
+    delay: optDelay.value
+  });
+}
+
+function applyScrapeOptions(options) {
+  const normalized = normalizeScrapeOptions(options);
+  optExpand.checked = normalized.expandReplies;
+  optImages.checked = normalized.includeImages;
+  optLimit.value = normalized.limit;
+  optDelay.value = normalized.delay;
+}
+
+async function restoreScrapeOptions() {
+  try {
+    const stored = await chrome.storage.local.get(SCRAPE_OPTIONS_STORAGE_KEY);
+    applyScrapeOptions(stored[SCRAPE_OPTIONS_STORAGE_KEY]);
+  } catch (error) {
+    applyScrapeOptions(null);
+    console.warn('Cannot restore scrape options:', error);
+  }
+}
+
+function persistScrapeOptions() {
+  chrome.storage.local.set({
+    [SCRAPE_OPTIONS_STORAGE_KEY]: getCurrentScrapeOptions()
+  }).catch(error => console.warn('Cannot persist scrape options:', error));
+}
+
+function getSelectedExportFields() {
+  return normalizeFieldKeys(exportFieldInputs.filter(input => input.checked).map(input => input.value));
+}
+
+function setExportFieldsExpanded(expanded) {
+  btnToggleFields.setAttribute('aria-expanded', String(expanded));
+  exportFieldsPanel.hidden = !expanded;
+  exportFieldChevron.textContent = expanded ? '▲' : '▼';
+}
+
+function applyExportFieldSelection(fieldKeys) {
+  const selected = new Set(normalizeFieldKeys(fieldKeys));
+  exportFieldInputs.forEach(input => {
+    input.checked = selected.has(input.value);
+  });
+}
+
+function updateExportButtons() {
+  const canExport = scrapedComments.length > 0 && getSelectedExportFields().length > 0;
+  btnExportCsv.disabled = !canExport;
+  btnExportJson.disabled = !canExport;
+}
+
+function updateExportFieldState(shouldPersist = true) {
+  const selectedFields = getSelectedExportFields();
+  exportFieldCount.textContent = `${selectedFields.length}/${EXPORT_FIELDS.length} หัวข้อ`;
+  updateExportButtons();
+  if (!shouldPersist) return;
+  try {
+    localStorage.setItem(EXPORT_FIELDS_STORAGE_KEY, JSON.stringify(selectedFields));
+  } catch (error) {
+    console.warn('Cannot persist export field selection:', error);
+  }
+}
+
+function restoreExportFieldSelection() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(EXPORT_FIELDS_STORAGE_KEY));
+    applyExportFieldSelection(Array.isArray(saved) ? saved : DEFAULT_EXPORT_FIELD_KEYS);
+  } catch (error) {
+    applyExportFieldSelection(DEFAULT_EXPORT_FIELD_KEYS);
+  }
+  updateExportFieldState(false);
+}
+
+function setPreviewLocked(locked, shouldLog = true) {
+  isPreviewLocked = locked && scrapedComments.length > 0;
+  btnLockPreview.setAttribute('aria-pressed', String(isPreviewLocked));
+  btnLockPreview.textContent = isPreviewLocked ? '🔒 ล็อกแล้ว' : '🔓 ล็อกผลลัพธ์';
+  btnLockPreview.disabled = scrapedComments.length === 0 || isScraping;
+  if (shouldLog) {
+    addLog(isPreviewLocked
+      ? 'ล็อก Live Preview แล้ว ผลลัพธ์จะไม่หายเมื่อเปิดชื่อหรือรูปในแท็บใหม่'
+      : 'ปลดล็อก Live Preview แล้ว');
+  }
+}
+
+function updatePreviewLockButton() {
+  btnLockPreview.disabled = scrapedComments.length === 0 || isScraping;
+}
+
 function resetResults() {
   scrapedComments = [];
   totalCommentsCount = 0;
   updateLivePreview([]);
   statTotal.textContent = '0';
-  btnExportCsv.disabled = true;
-  btnExportJson.disabled = true;
+  updateExportButtons();
 }
 
 function resetForTabChange(nextTabId) {
   const previousActiveTabId = activeTabId;
   const previousScrapeTabId = scrapeTabId;
+  const previousRunId = currentRunId;
   if (previousActiveTabId !== null) {
     chrome.tabs.sendMessage(previousActiveTabId, { action: 'exitPostSelection' }, () => {
       void chrome.runtime.lastError;
     });
   }
   if (isScraping && previousScrapeTabId !== null) {
-    chrome.tabs.sendMessage(previousScrapeTabId, { action: 'stopScrape' }, () => {
+    chrome.tabs.sendMessage(previousScrapeTabId, { action: 'stopScrape', runId: previousRunId }, () => {
       void chrome.runtime.lastError;
     });
   }
@@ -103,7 +219,7 @@ function resetForTabChange(nextTabId) {
   currentRunId = null;
   isScraping = false;
   hasSelectedPost = false;
-  resetResults();
+  if (!isPreviewLocked) resetResults();
   btnStart.disabled = true;
   btnStop.disabled = true;
   btnSelectPost.disabled = true;
@@ -116,6 +232,8 @@ function resetForTabChange(nextTabId) {
 
 // Initial connection check
 document.addEventListener('DOMContentLoaded', async () => {
+  restoreExportFieldSelection();
+  await restoreScrapeOptions();
   addLog("ส่วนควบคุม Side Panel เริ่มทำงาน...");
   await checkCurrentTab();
   
@@ -141,6 +259,22 @@ document.addEventListener('DOMContentLoaded', async () => {
   btnExportCsv.addEventListener('click', exportCsv);
   btnExportJson.addEventListener('click', exportJson);
   btnClearLog.addEventListener('click', clearLog);
+  btnLockPreview.addEventListener('click', () => setPreviewLocked(!isPreviewLocked));
+  btnToggleFields.addEventListener('click', () => {
+    setExportFieldsExpanded(btnToggleFields.getAttribute('aria-expanded') !== 'true');
+  });
+  exportFieldInputs.forEach(input => input.addEventListener('change', () => updateExportFieldState()));
+  btnFieldsAll.addEventListener('click', () => {
+    applyExportFieldSelection(EXPORT_FIELDS.map(field => field.key));
+    updateExportFieldState();
+  });
+  btnFieldsDefault.addEventListener('click', () => {
+    applyExportFieldSelection(DEFAULT_EXPORT_FIELD_KEYS);
+    updateExportFieldState();
+  });
+  [optExpand, optImages, optLimit, optDelay].forEach(option => {
+    option.addEventListener('change', persistScrapeOptions);
+  });
 });
 
 // Check current active tab and verify if it's Facebook
@@ -179,9 +313,6 @@ async function checkCurrentTab() {
             if (response.isScraping && response.runId) {
               restoreScrapingState(queriedTabId, response.runId);
               addLog("เชื่อมต่อกลับเข้าการดึงข้อมูลที่กำลังทำงาน...");
-            } else if (response.autoStart) {
-              addLog("เริ่มดึงข้อมูลอัตโนมัติ...");
-              startScraping();
             }
           } else {
             updatePostSelectedState(false);
@@ -201,13 +332,14 @@ async function checkCurrentTab() {
 
 function resetConnectionState(reasonText) {
   const previousActiveTabId = activeTabId;
+  const previousRunId = currentRunId;
   if (previousActiveTabId !== null) {
     chrome.tabs.sendMessage(previousActiveTabId, { action: 'exitPostSelection' }, () => {
       void chrome.runtime.lastError;
     });
   }
   if (isScraping && scrapeTabId !== null) {
-    chrome.tabs.sendMessage(scrapeTabId, { action: 'stopScrape' }, () => {
+    chrome.tabs.sendMessage(scrapeTabId, { action: 'stopScrape', runId: previousRunId }, () => {
       void chrome.runtime.lastError;
     });
   }
@@ -216,7 +348,7 @@ function resetConnectionState(reasonText) {
   currentRunId = null;
   isScraping = false;
   hasSelectedPost = false;
-  resetResults();
+  if (!isPreviewLocked) resetResults();
   pageStatusDot.className = 'status-dot';
   pageStatusText.textContent = reasonText;
   btnSelectPost.disabled = true;
@@ -286,6 +418,8 @@ function restoreScrapingState(tabId, runId) {
   isScraping = true;
   scrapeTabId = tabId;
   currentRunId = runId;
+  setPreviewLocked(false, false);
+  scrapedComments = [];
   btnStart.disabled = true;
   btnStop.disabled = false;
   btnSelectPost.disabled = true;
@@ -301,16 +435,15 @@ function restoreScrapingState(tabId, runId) {
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // Verify message is from the active tab
   if (sender.tab && sender.tab.id !== activeTabId) return;
-  if (message.runId && message.runId !== currentRunId) return;
+  if (message.action !== 'postSelected' && message.runId && message.runId !== currentRunId) return;
 
   switch (message.action) {
     case 'postSelected':
       updateSelectingState(false);
       updatePostSelectedState(true, message.message, message.totalComments);
       addLog(message.log || "ล็อกเป้าหมายโพสต์สำเร็จ!");
-      if (message.autoStart) {
-        addLog("เริ่มดึงข้อมูลอัตโนมัติ...");
-        startScraping();
+      if (message.isScraping && message.runId && sender.tab) {
+        restoreScrapingState(sender.tab.id, message.runId);
       }
       break;
       
@@ -352,6 +485,7 @@ function startScraping() {
   isScraping = true;
   scrapeTabId = targetTabId;
   currentRunId = runId;
+  setPreviewLocked(false, false);
   scrapedComments = [];
   
   // Update UI State
@@ -369,17 +503,12 @@ function startScraping() {
   showPreviewMessage('กำลังรอข้อมูลดิบจากสคริปต์หน้าเพจ...');
 
   // Send start scrape message to content script
-  const parsedLimit = Number.parseInt(optLimit.value, 10);
-  const parsedDelay = Number.parseInt(optDelay.value, 10);
+  const options = getCurrentScrapeOptions();
+  persistScrapeOptions();
   chrome.tabs.sendMessage(targetTabId, {
     action: 'startScrape',
     runId,
-    options: {
-      expandReplies: optExpand.checked,
-      includeImages: optImages.checked,
-      limit: Number.isFinite(parsedLimit) ? Math.max(0, parsedLimit) : 0,
-      delay: Number.isFinite(parsedDelay) ? Math.min(10, Math.max(1, parsedDelay)) : 2
-    }
+    options
   }, (response) => {
     if (currentRunId !== runId) return;
     if (chrome.runtime.lastError || !response || response.success !== true) {
@@ -422,13 +551,8 @@ function finishScrapingState(outcome = 'complete') {
     scrapingIndicator.style.color = 'var(--success)';
   }
   
-  if (scrapedComments.length > 0) {
-    btnExportCsv.disabled = false;
-    btnExportJson.disabled = false;
-  } else {
-    btnExportCsv.disabled = true;
-    btnExportJson.disabled = true;
-  }
+  updateExportButtons();
+  updatePreviewLockButton();
 }
 
 // Update Live Preview UI list and stats
@@ -441,6 +565,7 @@ function updateLivePreview(comments) {
   
   if (comments.length === 0) {
     showPreviewMessage('ไม่มีข้อมูลดิบแสดงผล');
+    updatePreviewLockButton();
     return;
   }
 
@@ -452,6 +577,7 @@ function updateLivePreview(comments) {
     const header = document.createElement('div');
     header.className = 'comment-card-header';
 
+    const profileUrl = normalizeExternalUrl(comment.profileUrl);
     const avatar = document.createElement('img');
     avatar.className = 'comment-avatar';
     avatar.alt = 'avatar';
@@ -463,7 +589,6 @@ function updateLivePreview(comments) {
     const author = document.createElement('a');
     author.className = 'comment-author';
     author.textContent = comment.name || 'ไม่ทราบชื่อ';
-    const profileUrl = normalizeExternalUrl(comment.profileUrl);
     if (profileUrl) {
       author.href = profileUrl;
       author.target = '_blank';
@@ -473,7 +598,18 @@ function updateLivePreview(comments) {
     const timestamp = document.createElement('span');
     timestamp.className = 'comment-time';
     timestamp.textContent = comment.timestamp || '';
-    header.append(avatar, author, timestamp);
+    let avatarNode = avatar;
+    if (profileUrl) {
+      const avatarLink = document.createElement('a');
+      avatarLink.className = 'comment-avatar-link';
+      avatarLink.href = profileUrl;
+      avatarLink.target = '_blank';
+      avatarLink.rel = 'noopener noreferrer';
+      avatarLink.title = `เปิดโปรไฟล์ ${comment.name || ''}`.trim();
+      avatarLink.appendChild(avatar);
+      avatarNode = avatarLink;
+    }
+    header.append(avatarNode, author, timestamp);
 
     const commentText = document.createElement('div');
     commentText.className = 'comment-text';
@@ -491,11 +627,16 @@ function updateLivePreview(comments) {
       attachment.title = 'เปิดหน้าต่างใหม่เพื่อดูรูปใหญ่';
       const photoUrl = normalizeExternalUrl(comment.photoUrl) || normalizeExternalUrl(comment.imageUrl);
       if (photoUrl) {
-        attachment.addEventListener('click', () => {
-          window.open(photoUrl, '_blank', 'noopener,noreferrer');
-        });
+        const attachmentLink = document.createElement('a');
+        attachmentLink.className = 'comment-attachment-link';
+        attachmentLink.href = photoUrl;
+        attachmentLink.target = '_blank';
+        attachmentLink.rel = 'noopener noreferrer';
+        attachmentLink.appendChild(attachment);
+        card.appendChild(attachmentLink);
+      } else {
+        card.appendChild(attachment);
       }
-      card.appendChild(attachment);
     }
 
     fragment.appendChild(card);
@@ -507,22 +648,19 @@ function updateLivePreview(comments) {
     fragment.appendChild(notice);
   }
   previewList.appendChild(fragment);
+  updatePreviewLockButton();
 }
 
 // Export CSV
 function exportCsv() {
   if (scrapedComments.length === 0) return;
 
-  const headers = ['ID', 'Type', 'Author_Name', 'Profile_Link', 'Timestamp', 'Text', 'Photo_Link'];
-  const rows = scrapedComments.map(c => [
-    c.id,
-    c.type,
-    c.name,
-    c.profileUrl,
-    c.timestamp || '',
-    c.text ? c.text.replace(/\s*\r?\n\s*/g, ' ') : '',
-    c.photoUrl || ''
-  ]);
+  const selectedFields = getSelectedExportFields();
+  if (selectedFields.length === 0) {
+    addLog('[ผิดพลาด] กรุณาเลือกหัวข้อข้อมูลอย่างน้อย 1 รายการ');
+    return;
+  }
+  const { headers, rows } = buildCsvTable(scrapedComments, selectedFields);
 
   const escapeCsv = (val) => {
     if (val === null || val === undefined) return '';
@@ -568,35 +706,12 @@ function exportCsv() {
 function exportJson() {
   if (scrapedComments.length === 0) return;
 
-  // Build tree structure
-  const mainComments = scrapedComments.filter(c => c.type === 'Comment').map(c => ({
-    id: c.id,
-    name: c.name,
-    profileUrl: c.profileUrl,
-    timestamp: c.timestamp,
-    text: c.text,
-    photoUrl: c.photoUrl,
-    replies: []
-  }));
-
-  const replies = scrapedComments.filter(c => c.type === 'Reply');
-  const mainCommentsById = new Map(mainComments.map(comment => [comment.id, comment]));
-  
-  replies.forEach(r => {
-    const parent = mainCommentsById.get(r.parentId);
-    if (parent) {
-      parent.replies.push({
-        id: r.id,
-        name: r.name,
-        profileUrl: r.profileUrl,
-        timestamp: r.timestamp,
-        text: r.text,
-        photoUrl: r.photoUrl
-      });
-    }
-  });
-
-  const jsonContent = JSON.stringify(mainComments, null, 2);
+  const selectedFields = getSelectedExportFields();
+  if (selectedFields.length === 0) {
+    addLog('[ผิดพลาด] กรุณาเลือกหัวข้อข้อมูลอย่างน้อย 1 รายการ');
+    return;
+  }
+  const jsonContent = JSON.stringify(buildJsonTree(scrapedComments, selectedFields), null, 2);
   const blob = new Blob([jsonContent], { type: 'application/json;charset=utf-8;' });
   const url = URL.createObjectURL(blob);
   
@@ -623,5 +738,6 @@ function clearLog() {
   addLog("ล้างบันทึกการทำงานเรียบร้อย");
   
   // Clear preview and scraped data
+  setPreviewLocked(false, false);
   resetResults();
 }

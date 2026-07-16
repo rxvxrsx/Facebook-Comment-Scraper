@@ -5,13 +5,40 @@ const test = require('node:test');
 const { JSDOM } = require('jsdom');
 
 const {
+  DEFAULT_SCRAPE_OPTIONS,
   classifyExpandControlText,
   countMainCommentsByOffsets,
   findExpandCandidates,
+  getFacebookPostId,
   getFacebookProfileKey,
+  normalizeScrapeOptions,
   waitForCondition,
   waitForDomChange
 } = require('../scraper-core');
+
+test('post IDs survive feed-to-permalink navigation', () => {
+  assert.equal(
+    getFacebookPostId('https://www.facebook.com/groups/948531731515720/permalink/977714681930758/'),
+    '977714681930758'
+  );
+  assert.equal(getFacebookPostId('/groups/948531731515720/posts/977714681930758'), '977714681930758');
+  assert.equal(getFacebookPostId('/permalink.php?story_fbid=977714681930758&id=123'), '977714681930758');
+});
+
+test('scrape options normalize inline and Side Panel settings consistently', () => {
+  assert.deepEqual(normalizeScrapeOptions(null), DEFAULT_SCRAPE_OPTIONS);
+  assert.deepEqual(normalizeScrapeOptions({
+    expandReplies: false,
+    includeImages: false,
+    limit: '-5',
+    delay: '99'
+  }), {
+    expandReplies: false,
+    includeImages: false,
+    limit: 0,
+    delay: 10
+  });
+});
 
 function loadFixture(name) {
   const html = fs.readFileSync(path.join(__dirname, 'fixtures', name), 'utf8');

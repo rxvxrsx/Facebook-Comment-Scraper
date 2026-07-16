@@ -6,6 +6,28 @@
     root.FbScraperCore = api;
   }
 })(typeof globalThis !== 'undefined' ? globalThis : this, function() {
+  const SCRAPE_OPTIONS_STORAGE_KEY = 'fbScraperOptions';
+  const DEFAULT_SCRAPE_OPTIONS = Object.freeze({
+    expandReplies: true,
+    includeImages: true,
+    limit: 0,
+    delay: 2
+  });
+
+  function normalizeScrapeOptions(value) {
+    const options = value && typeof value === 'object' ? value : {};
+    const parsedLimit = Number.parseInt(options.limit, 10);
+    const parsedDelay = Number.parseInt(options.delay, 10);
+    return {
+      expandReplies: options.expandReplies !== false,
+      includeImages: options.includeImages !== false,
+      limit: Number.isFinite(parsedLimit) ? Math.max(0, parsedLimit) : DEFAULT_SCRAPE_OPTIONS.limit,
+      delay: Number.isFinite(parsedDelay)
+        ? Math.min(10, Math.max(1, parsedDelay))
+        : DEFAULT_SCRAPE_OPTIONS.delay
+    };
+  }
+
   function getFacebookProfileKey(value, origin = 'https://www.facebook.com') {
     if (!value) return '';
     try {
@@ -32,6 +54,28 @@
     } catch (error) {
       return String(value).split('?')[0].split('#')[0].toLowerCase();
     }
+  }
+
+  function getFacebookPostId(value, origin = 'https://www.facebook.com') {
+    if (!value) return '';
+    try {
+      const url = new URL(value, origin);
+      const parts = url.pathname.split('/').filter(Boolean);
+      for (const segment of ['permalink', 'posts', 'videos']) {
+        const index = parts.indexOf(segment);
+        if (index !== -1 && /^\d+$/.test(parts[index + 1] || '')) {
+          return parts[index + 1];
+        }
+      }
+
+      for (const parameter of ['story_fbid', 'fbid', 'video_id']) {
+        const id = url.searchParams.get(parameter);
+        if (/^\d+$/.test(id || '')) return id;
+      }
+    } catch (error) {
+      return '';
+    }
+    return '';
   }
 
   function classifyExpandControlText(value, expandReplies) {
@@ -151,10 +195,14 @@
   }
 
   return {
+    DEFAULT_SCRAPE_OPTIONS,
+    SCRAPE_OPTIONS_STORAGE_KEY,
     classifyExpandControlText,
     countMainCommentsByOffsets,
     findExpandCandidates,
+    getFacebookPostId,
     getFacebookProfileKey,
+    normalizeScrapeOptions,
     pruneNestedCandidates,
     waitForCondition,
     waitForDomChange

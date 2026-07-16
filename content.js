@@ -2,9 +2,13 @@
 
 (function() {
   const {
+    DEFAULT_SCRAPE_OPTIONS,
+    SCRAPE_OPTIONS_STORAGE_KEY,
     countMainCommentsByOffsets,
     findExpandCandidates,
+    getFacebookPostId,
     getFacebookProfileKey,
+    normalizeScrapeOptions,
     waitForCondition,
     waitForDomChange
   } = globalThis.FbScraperCore;
@@ -24,8 +28,11 @@
   let buttonClickProgress = new WeakMap();
   let lastHoveredElement = null;
   let scrapedComments = [];
-  let shouldAutoStart = false;
   let activeRunId = null;
+  let activeInlineButton = null;
+  const INLINE_BUTTON_SELECTOR = '.fb-scraper-inline-btn';
+  let lastObservedUrl = window.location.href;
+  let pendingResumeInFlight = false;
 
   // Logger helper: dispatches log to side panel
   function sendLog(message) {
@@ -41,12 +48,202 @@
     }
   }
 
+  async function loadStoredScrapeOptions() {
+    try {
+      const stored = await chrome.storage.local.get(SCRAPE_OPTIONS_STORAGE_KEY);
+      return normalizeScrapeOptions(stored[SCRAPE_OPTIONS_STORAGE_KEY]);
+    } catch (error) {
+      console.warn('Cannot load saved scrape options:', error);
+      return { ...DEFAULT_SCRAPE_OPTIONS };
+    }
+  }
+
+  function beginScraping(options, runId) {
+    if (!selectedPostElement || !selectedPostElement.isConnected) {
+      selectedPostElement = null;
+      return {
+        success: false,
+        selectionInvalid: true,
+        error: 'โพสต์เป้าหมายไม่อยู่บนหน้าแล้ว กรุณาเลือกใหม่'
+      };
+    }
+    if (isScraping) return { success: false, error: 'มีการดึงข้อมูลกำลังทำงานอยู่' };
+    if (!runId) return { success: false, error: 'ไม่พบรหัสการทำงาน' };
+
+    const normalizedOptions = normalizeScrapeOptions(options);
+    isScraping = true;
+    shouldStopScraping = false;
+    activeRunId = runId;
+    setTimeout(() => startScrapingWorkflow(normalizedOptions, runId), 0);
+    return { success: true };
+  }
+
+  function resetInlineButton() {
+    if (!activeInlineButton?.isConnected) {
+      activeInlineButton = null;
+      return;
+    }
+    activeInlineButton.innerText = '📊 ดึงความเห็น';
+    activeInlineButton.style.pointerEvents = '';
+    activeInlineButton.style.opacity = '';
+    activeInlineButton = null;
+  }
+
+  function isSinglePostUrl(value = window.location.href) {
+    return value.includes('/posts/') || value.includes('/permalink.php') ||
+      value.includes('/permalink/') || value.includes('/photos/') || value.includes('/videos/');
+  }
+
+  function findPostId(post) {
+    const links = [];
+    const parentLink = post.closest('a[href]');
+    if (parentLink) links.push(parentLink.href);
+    links.push(...Array.from(post.querySelectorAll('a[href]'), link => link.href));
+    for (const href of links) {
+      const id = getFacebookPostId(href);
+      if (id) return id;
+    }
+    return '';
+  }
+
+  function queueInlineScrapeHandoff(post) {
+    if (isSinglePostUrl()) return;
+    const sourceUrl = window.location.href;
+    chrome.runtime.sendMessage({
+      action: 'queueInlineScrape',
+      targetPostId: findPostId(post)
+    }).catch(() => {});
+
+    // No navigation means scraping continues on the feed; discard stale handoff.
+    setTimeout(() => {
+      if (window.location.href === sourceUrl) {
+        chrome.runtime.sendMessage({ action: 'clearQueuedInlineScrape' }).catch(() => {});
+      }
+    }, 10_000);
+  }
+
+  async function startInlineScraping(btn) {
+    const post = btn.closest('[role="article"]');
+    if (!post?.isConnected) return;
+
+    queueInlineScrapeHandoff(post);
+    chrome.runtime.sendMessage({ action: 'openSidePanel' });
+    if (isScraping) {
+      sendLog('มีการดึงข้อมูลกำลังทำงานอยู่ กรุณารอหรือกดหยุดใน Side Panel');
+      return;
+    }
+
+    if (selectedPostElement) {
+      selectedPostElement.style.outline = '';
+      selectedPostElement.style.outlineOffset = '';
+    }
+
+    selectedPostElement = post;
+    selectedPostElement.style.outline = '3px solid #10b981';
+    selectedPostElement.style.outlineOffset = '4px';
+    selectedPostElement.style.borderRadius = '8px';
+
+    selectedPostElement.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    activeInlineButton = btn;
+    btn.innerText = '⏳ กำลังเริ่มดึงข้อมูล...';
+    btn.style.pointerEvents = 'none';
+    btn.style.opacity = '0.8';
+
+    const options = await loadStoredScrapeOptions();
+    const runId = `inline-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const result = beginScraping(options, runId);
+    chrome.runtime.sendMessage({
+      action: 'postSelected',
+      message: result.success ? 'เลือกโพสต์และเริ่มดึงข้อมูลแล้ว' : 'เลือกโพสต์เรียบร้อย',
+      log: result.success
+        ? "กดปุ่มลัด 'ดึงความเห็น' — เริ่มทำงานทันที!"
+        : `[ผิดพลาด] เริ่มดึงข้อมูลไม่ได้: ${result.error}`,
+      isScraping: result.success,
+      runId: result.success ? runId : null,
+      totalComments: getTotalCommentsCount(selectedPostElement)
+    });
+    if (result.success) {
+      btn.innerText = '⏳ กำลังดึงความเห็น...';
+    } else {
+      resetInlineButton();
+    }
+  }
+
+  // Facebook handles post navigation during capture. Intercept at window before
+  // the event reaches React's root, otherwise clicking this button opens the post.
+  function handleInlineButtonInteraction(event) {
+    const btn = event.target instanceof Element
+      ? event.target.closest(INLINE_BUTTON_SELECTOR)
+      : null;
+    if (!btn) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+
+    if (event.type === 'click') {
+      void startInlineScraping(btn);
+    }
+  }
+
+  window.addEventListener('pointerdown', handleInlineButtonInteraction, true);
+  window.addEventListener('mousedown', handleInlineButtonInteraction, true);
+  window.addEventListener('click', handleInlineButtonInteraction, true);
+
+  async function resumeQueuedInlineScrape() {
+    if (pendingResumeInFlight || isScraping || !isSinglePostUrl()) return;
+    pendingResumeInFlight = true;
+    try {
+      const response = await chrome.runtime.sendMessage({
+        action: 'getQueuedInlineScrape',
+        currentPostId: getFacebookPostId(window.location.href)
+      });
+      if (!response?.pending) return;
+
+      const post = await waitForCondition(document.documentElement, () => {
+        if (!selectedPostElement?.isConnected) autoDetectPost();
+        return selectedPostElement?.isConnected ? selectedPostElement : null;
+      }, 15_000);
+      if (!post) return;
+
+      chrome.runtime.sendMessage({ action: 'openSidePanel' });
+      const options = await loadStoredScrapeOptions();
+      const runId = `permalink-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const result = beginScraping(options, runId);
+      if (!result.success) return;
+
+      await chrome.runtime.sendMessage({ action: 'clearQueuedInlineScrape' });
+      chrome.runtime.sendMessage({
+        action: 'postSelected',
+        message: 'เปิดหน้าโพสต์และเริ่มดึงข้อมูลอัตโนมัติแล้ว',
+        log: 'รับคำสั่งจากปุ่มบนหน้าเดิม — เริ่มดึงความเห็นอัตโนมัติ!',
+        isScraping: true,
+        runId,
+        totalComments: getTotalCommentsCount(selectedPostElement)
+      });
+    } catch (error) {
+      console.warn('Cannot resume queued inline scrape:', error);
+    } finally {
+      pendingResumeInFlight = false;
+    }
+  }
+
+  function checkForFacebookRouteChange() {
+    if (window.location.href === lastObservedUrl) return;
+    lastObservedUrl = window.location.href;
+    if (isScraping) {
+      shouldStopScraping = true;
+    }
+    selectedPostElement = null;
+    if (!isScraping) void resumeQueuedInlineScrape();
+  }
+
   // Check and auto-detect post if on single post pages
   function autoDetectPost() {
     const url = window.location.href;
-    const isSinglePostUrl = url.includes('/posts/') || url.includes('/permalink.php') || url.includes('/photos/') || url.includes('/videos/');
+    const isSinglePostPage = isSinglePostUrl(url);
     
-    if (isSinglePostUrl) {
+    if (isSinglePostPage) {
       const articles = Array.from(document.querySelectorAll('[role="article"]')).filter(article =>
         !article.parentElement?.closest('[role="article"]')
       );
@@ -89,11 +286,9 @@
         sendResponse({ 
           hasSelected: !!selectedPostElement, 
           message: selectedPostElement ? 'เลือกโพสต์เรียบร้อย (ตรวจพบอัตโนมัติ)' : 'ยังไม่ได้เลือกโพสต์',
-          autoStart: shouldAutoStart,
           isScraping,
           runId: activeRunId
         });
-        shouldAutoStart = false;
         break;
 
       case 'enterPostSelection':
@@ -107,29 +302,7 @@
         break;
 
       case 'startScrape':
-        if (!selectedPostElement || !selectedPostElement.isConnected) {
-          selectedPostElement = null;
-          sendResponse({
-            success: false,
-            selectionInvalid: true,
-            error: 'โพสต์เป้าหมายไม่อยู่บนหน้าแล้ว กรุณาเลือกใหม่'
-          });
-          break;
-        }
-        if (isScraping) {
-          sendResponse({ success: false, error: 'มีการดึงข้อมูลกำลังทำงานอยู่' });
-          break;
-        }
-        if (!message.runId) {
-          sendResponse({ success: false, error: 'ไม่พบรหัสการทำงาน' });
-          break;
-        }
-        isScraping = true;
-        shouldStopScraping = false;
-        activeRunId = message.runId;
-        // Run asynchronously after acknowledging the Side Panel request.
-        setTimeout(() => startScrapingWorkflow(message.options || {}, message.runId), 0);
-        sendResponse({ success: true });
+        sendResponse(beginScraping(message.options, message.runId));
         break;
 
       case 'stopScrape':
@@ -237,7 +410,8 @@
     topLevelPosts.forEach(post => {
       if (post.querySelector('.fb-scraper-inline-btn')) return;
       
-      const btn = document.createElement('div');
+      const btn = document.createElement('button');
+      btn.type = 'button';
       btn.className = 'fb-scraper-inline-btn';
       btn.innerText = '📊 ดึงความเห็น';
       
@@ -245,11 +419,13 @@
       btn.style.top = '12px';
       btn.style.right = '60px'; // Offset to avoid blocking the three-dots menu
       btn.style.background = 'linear-gradient(135deg, #4f46e5, #06b6d4)';
+      btn.style.border = 'none';
       btn.style.color = '#ffffff';
       btn.style.padding = '4px 10px';
       btn.style.borderRadius = '12px';
       btn.style.fontSize = '11px';
       btn.style.fontWeight = 'bold';
+      btn.style.fontFamily = 'inherit';
       btn.style.cursor = 'pointer';
       btn.style.zIndex = '999';
       btn.style.boxShadow = '0 2px 5px rgba(0,0,0,0.2)';
@@ -265,37 +441,6 @@
         btn.style.background = 'linear-gradient(135deg, #4f46e5, #06b6d4)';
       });
       
-      btn.addEventListener('click', (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        
-        if (selectedPostElement) {
-          selectedPostElement.style.outline = '';
-          selectedPostElement.style.outlineOffset = '';
-        }
-        
-        selectedPostElement = post;
-        selectedPostElement.style.outline = '3px solid #10b981';
-        selectedPostElement.style.outlineOffset = '4px';
-        selectedPostElement.style.borderRadius = '8px';
-        
-        shouldAutoStart = true;
-
-        // Open Side Panel programmatically
-        chrome.runtime.sendMessage({ action: 'openSidePanel' });
-        
-        // Notify Side Panel (in case it is already open)
-        chrome.runtime.sendMessage({ 
-          action: 'postSelected', 
-          message: 'เลือกโพสต์เรียบร้อย (จากปุ่มดึงความเห็น)', 
-          log: "เลือกโพสต์เป้าหมายผ่านปุ่มลัด 'ดึงความเห็น' บนโพสต์เรียบร้อย!",
-          autoStart: true,
-          totalComments: getTotalCommentsCount(selectedPostElement)
-        });
-
-        selectedPostElement.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      });
-      
       const style = window.getComputedStyle(post);
       if (style.position === 'static') {
         post.style.position = 'relative';
@@ -309,6 +454,7 @@
   const pendingInjectionRoots = new Set();
   let injectionTimer = null;
   const injectionObserver = new MutationObserver(mutations => {
+    checkForFacebookRouteChange();
     for (const mutation of mutations) {
       for (const node of mutation.addedNodes) {
         if (node.nodeType !== Node.ELEMENT_NODE) continue;
@@ -822,6 +968,8 @@
       if (activeRunId === runId) {
         isScraping = false;
         activeRunId = null;
+        resetInlineButton();
+        void resumeQueuedInlineScrape();
       }
     }
   }
@@ -1092,6 +1240,7 @@
 
   // Initialize auto detect on load
   autoDetectPost();
+  void resumeQueuedInlineScrape();
   
   console.log("FB Comment Scraper page worker ready.");
 })();

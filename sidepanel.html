@@ -62,18 +62,20 @@
     }
 
     .header-logo {
-      background: linear-gradient(135deg, var(--primary), var(--accent));
       width: 32px;
       height: 32px;
       border-radius: 8px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-weight: bold;
-      color: white;
-      font-size: 16px;
       margin-right: 12px;
       box-shadow: 0 4px 10px rgba(79, 70, 229, 0.3);
+      overflow: hidden;
+      flex: 0 0 32px;
+    }
+
+    .header-logo img {
+      display: block;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
     }
 
     .header-title h2 {
@@ -258,6 +260,86 @@
       text-align: center;
     }
 
+    .export-fields-menu {
+      background-color: rgba(30, 41, 59, 0.4);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      overflow: hidden;
+    }
+
+    .btn-export-fields {
+      cursor: pointer;
+      width: 100%;
+      border: none;
+      background: #172033;
+      color: var(--text-main);
+      padding: 12px;
+      font-size: 13px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      user-select: none;
+      font-family: inherit;
+    }
+
+    .btn-export-fields:hover {
+      background: #253248;
+    }
+
+    .export-field-summary-meta {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .export-field-count {
+      color: var(--accent);
+      font-size: 11px;
+    }
+
+    .export-fields-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+      padding: 12px;
+      border-top: 1px solid var(--border);
+    }
+
+    .export-fields-grid[hidden] {
+      display: none;
+    }
+
+    .export-field-item {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      color: var(--text-main);
+    }
+
+    .export-field-item input {
+      accent-color: var(--primary);
+    }
+
+    .export-field-actions {
+      grid-column: 1 / -1;
+      display: flex;
+      gap: 8px;
+      padding-top: 4px;
+    }
+
+    .btn-field-action {
+      flex: 1;
+      padding: 5px 8px;
+      border: 1px solid #334155;
+      border-radius: 6px;
+      background: #0f172a;
+      color: var(--text-muted);
+      cursor: pointer;
+      font-size: 11px;
+    }
+
     .controls-row {
       display: flex;
       gap: 10px;
@@ -318,6 +400,35 @@
       min-height: 180px;
     }
 
+    .preview-title-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .btn-lock-preview {
+      border: 1px solid #334155;
+      border-radius: 6px;
+      padding: 4px 8px;
+      background: #172033;
+      color: var(--text-muted);
+      cursor: pointer;
+      font-size: 11px;
+      font-family: inherit;
+    }
+
+    .btn-lock-preview[aria-pressed="true"] {
+      color: #a7f3d0;
+      border-color: var(--success);
+      background: rgba(16, 185, 129, 0.12);
+    }
+
+    .btn-lock-preview:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+
     .preview-list {
       flex: 1;
       border: 1px solid var(--border);
@@ -371,6 +482,12 @@
       object-fit: cover;
     }
 
+    .comment-avatar-link {
+      display: flex;
+      flex: 0 0 auto;
+      border-radius: 50%;
+    }
+
     .comment-author {
       font-weight: 700;
       color: var(--text-main);
@@ -401,6 +518,11 @@
       cursor: zoom-in;
     }
 
+    .comment-attachment-link {
+      display: inline-flex;
+      align-self: flex-start;
+    }
+
     #btn-clear-log {
       transition: color 0.2s;
     }
@@ -422,7 +544,9 @@
 <body>
   <!-- Header -->
   <div class="header">
-    <div class="header-logo">FB</div>
+    <div class="header-logo">
+      <img src="image/logo_1.png" alt="FB Comment Scraper">
+    </div>
     <div class="header-title">
       <h2>FB Comment Scraper</h2>
       <p id="scraping-indicator">พร้อมใช้งาน (ระบบ Side Panel)</p>
@@ -465,6 +589,33 @@
       </div>
     </div>
 
+    <!-- Export Fields -->
+    <div>
+      <div class="section-title">หัวข้อข้อมูลที่ต้องการบันทึก</div>
+      <div class="export-fields-menu">
+        <button type="button" id="btn-toggle-fields" class="btn-export-fields" aria-expanded="false" aria-controls="export-fields-panel">
+          <span>⚙ เลือกหัวข้อที่จะบันทึก</span>
+          <span class="export-field-summary-meta">
+            <span id="export-field-count" class="export-field-count"></span>
+            <span id="export-field-chevron" aria-hidden="true">▼</span>
+          </span>
+        </button>
+        <div id="export-fields-panel" class="export-fields-grid" hidden>
+          <label class="export-field-item"><input type="checkbox" class="export-field" value="id" checked> ID</label>
+          <label class="export-field-item"><input type="checkbox" class="export-field" value="type" checked> ประเภท</label>
+          <label class="export-field-item"><input type="checkbox" class="export-field" value="name" checked> ชื่อผู้เขียน</label>
+          <label class="export-field-item"><input type="checkbox" class="export-field" value="profileUrl" checked> ลิงก์โปรไฟล์</label>
+          <label class="export-field-item"><input type="checkbox" class="export-field" value="timestamp" checked> เวลา</label>
+          <label class="export-field-item"><input type="checkbox" class="export-field" value="text" checked> ข้อความ</label>
+          <label class="export-field-item"><input type="checkbox" class="export-field" value="photoUrl" checked> ลิงก์รูปภาพ</label>
+          <div class="export-field-actions">
+            <button type="button" id="btn-fields-all" class="btn-field-action">เลือกทั้งหมด</button>
+            <button type="button" id="btn-fields-default" class="btn-field-action">ค่าเริ่มต้น</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- Control Buttons -->
     <div class="controls-row">
       <button id="btn-start" class="btn btn-primary" disabled>เริ่มดึงข้อมูล (Start)</button>
@@ -498,7 +649,10 @@
 
     <!-- Live Preview -->
     <div class="preview-container">
-      <div class="section-title">ตัวอย่างคอมเมนต์สด (Live Preview)</div>
+      <div class="preview-title-row">
+        <div class="section-title">ตัวอย่างคอมเมนต์สด (Live Preview)</div>
+        <button type="button" id="btn-lock-preview" class="btn-lock-preview" aria-pressed="false" disabled>🔓 ล็อกผลลัพธ์</button>
+      </div>
       <div id="preview-list" class="preview-list">
         <div class="preview-empty">ไม่มีข้อมูลดิบแสดงผล</div>
       </div>
@@ -511,6 +665,8 @@
     <button id="btn-export-json" class="btn btn-export" disabled>ส่งออก (JSON)</button>
   </div>
 
+  <script src="scraper-core.js"></script>
+  <script src="export-core.js"></script>
   <script src="sidepanel.js"></script>
 </body>
 </html>
