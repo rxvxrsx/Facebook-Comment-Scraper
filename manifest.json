@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "FB Comment Scraper - ตัวดึงคอมเมนต์เฟซบุ๊ก",
-  "version": "1.1",
+  "version": "1.2",
   "description": "ดึงข้อมูลความคิดเห็นในกลุ่มเฟซบุ๊กส่วนตัว รวมถึงรูปภาพแนบและคอมเมนต์ย่อย แสดงผลผ่าน Chrome Side Panel และส่งออกไฟล์ CSV/JSON",
   "permissions": [
     "activeTab",
@@ -29,6 +29,7 @@
         "*://*.fb.com/*"
       ],
       "js": [
+        "scraper-core.js",
         "content.js"
       ],
       "run_at": "document_idle"

@@ -1,6 +1,14 @@
 // content.js - Pure Web Worker Content Script for Facebook Comment Scraper (Side Panel Mode)
 
 (function() {
+  const {
+    countMainCommentsByOffsets,
+    findExpandCandidates,
+    getFacebookProfileKey,
+    waitForCondition,
+    waitForDomChange
+  } = globalThis.FbScraperCore;
+
   // Prevent duplicate injection
   if (window.hasOwnProperty('__fbCommentScraperInjected')) {
     console.log("FB Comment Scraper worker already active.");
@@ -13,27 +21,23 @@
   let isSelectingPost = false;
   let isScraping = false;
   let shouldStopScraping = false;
-  let clickedButtons = new Set();
+  let buttonClickProgress = new WeakMap();
   let lastHoveredElement = null;
   let scrapedComments = [];
   let shouldAutoStart = false;
+  let activeRunId = null;
 
   // Logger helper: dispatches log to side panel
   function sendLog(message) {
     try {
-      chrome.runtime.sendMessage({ action: 'log', message: message });
+      chrome.runtime.sendMessage({
+        action: 'log',
+        message: message,
+        ...(activeRunId ? { runId: activeRunId } : {})
+      });
     } catch (e) {
       // Side Panel might be closed
       console.log(`[Log] ${message}`);
-    }
-  }
-
-  // Preview helper: dispatches live preview comments list to side panel
-  function sendPreviewUpdate() {
-    try {
-      chrome.runtime.sendMessage({ action: 'previewUpdate', comments: scrapedComments });
-    } catch (e) {
-      console.log("Failed to send live preview update to Side Panel.");
     }
   }
 
@@ -43,10 +47,19 @@
     const isSinglePostUrl = url.includes('/posts/') || url.includes('/permalink.php') || url.includes('/photos/') || url.includes('/videos/');
     
     if (isSinglePostUrl) {
-      const articles = Array.from(document.querySelectorAll('[role="article"]'));
+      const articles = Array.from(document.querySelectorAll('[role="article"]')).filter(article =>
+        !article.parentElement?.closest('[role="article"]')
+      );
       if (articles.length > 0) {
-        articles.sort((a, b) => b.innerHTML.length - a.innerHTML.length);
-        const mainArticle = articles[0];
+        let mainArticle = articles[0];
+        let largestTextLength = -1;
+        for (const article of articles) {
+          const textLength = article.textContent?.length || 0;
+          if (textLength > largestTextLength) {
+            largestTextLength = textLength;
+            mainArticle = article;
+          }
+        }
         
         // Highlight post
         if (selectedPostElement) selectedPostElement.style.outline = '';
@@ -66,6 +79,9 @@
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     switch (message.action) {
       case 'checkSelectedStatus':
+        if (selectedPostElement && !selectedPostElement.isConnected) {
+          selectedPostElement = null;
+        }
         // Try auto detect if nothing selected yet
         if (!selectedPostElement) {
           autoDetectPost();
@@ -73,7 +89,9 @@
         sendResponse({ 
           hasSelected: !!selectedPostElement, 
           message: selectedPostElement ? 'เลือกโพสต์เรียบร้อย (ตรวจพบอัตโนมัติ)' : 'ยังไม่ได้เลือกโพสต์',
-          autoStart: shouldAutoStart
+          autoStart: shouldAutoStart,
+          isScraping,
+          runId: activeRunId
         });
         shouldAutoStart = false;
         break;
@@ -89,16 +107,36 @@
         break;
 
       case 'startScrape':
-        if (!selectedPostElement) {
-          chrome.runtime.sendMessage({ action: 'scrapeFailed', error: 'ยังไม่ได้เลือกโพสต์เป้าหมาย' });
-          return;
+        if (!selectedPostElement || !selectedPostElement.isConnected) {
+          selectedPostElement = null;
+          sendResponse({
+            success: false,
+            selectionInvalid: true,
+            error: 'โพสต์เป้าหมายไม่อยู่บนหน้าแล้ว กรุณาเลือกใหม่'
+          });
+          break;
         }
-        // Run scraping asynchronously to let background listener return immediately
-        setTimeout(() => startScrapingWorkflow(message.options), 50);
+        if (isScraping) {
+          sendResponse({ success: false, error: 'มีการดึงข้อมูลกำลังทำงานอยู่' });
+          break;
+        }
+        if (!message.runId) {
+          sendResponse({ success: false, error: 'ไม่พบรหัสการทำงาน' });
+          break;
+        }
+        isScraping = true;
+        shouldStopScraping = false;
+        activeRunId = message.runId;
+        // Run asynchronously after acknowledging the Side Panel request.
+        setTimeout(() => startScrapingWorkflow(message.options || {}, message.runId), 0);
         sendResponse({ success: true });
         break;
 
       case 'stopScrape':
+        if (!isScraping || (message.runId && message.runId !== activeRunId)) {
+          sendResponse({ success: false, error: 'ไม่พบการทำงานที่ต้องการหยุด' });
+          break;
+        }
         shouldStopScraping = true;
         sendLog("ผู้ใช้สั่งหยุดการทำงาน... กำลังสรุปข้อมูลล่าสุด");
         sendResponse({ success: true });
@@ -174,10 +212,16 @@
   }
 
   // Inject "Scrape" shortcut button directly on top of each Facebook post container
-  function injectScrapeButtons() {
-    const articles = Array.from(document.querySelectorAll('[role="article"]'));
+  function injectScrapeButtons(root = document) {
+    const articles = [];
+    if (root instanceof Element && root.matches('[role="article"]')) {
+      articles.push(root);
+    }
+    if (root.querySelectorAll) {
+      articles.push(...root.querySelectorAll('[role="article"]'));
+    }
     const topLevelPosts = articles.filter(art => {
-      if (art.parentElement.closest('[role="article"]')) return false;
+      if (art.parentElement?.closest('[role="article"]')) return false;
       
       // Prevent injecting buttons in Messenger chat windows, sidebars, or message bubbles
       const rect = art.getBoundingClientRect();
@@ -191,7 +235,7 @@
     });
     
     topLevelPosts.forEach(post => {
-      if (post.dataset.hasScrapeButton === 'true' || post.querySelector('.fb-scraper-inline-btn')) return;
+      if (post.querySelector('.fb-scraper-inline-btn')) return;
       
       const btn = document.createElement('div');
       btn.className = 'fb-scraper-inline-btn';
@@ -258,13 +302,33 @@
       }
       
       post.appendChild(btn);
-      post.dataset.hasScrapeButton = 'true';
     });
   }
 
-  // Periodic scan to inject buttons dynamically
-  setInterval(injectScrapeButtons, 2000);
-  setTimeout(injectScrapeButtons, 1000);
+  // Scan only newly added Facebook DOM branches instead of rescanning the whole page every 2 seconds.
+  const pendingInjectionRoots = new Set();
+  let injectionTimer = null;
+  const injectionObserver = new MutationObserver(mutations => {
+    for (const mutation of mutations) {
+      for (const node of mutation.addedNodes) {
+        if (node.nodeType !== Node.ELEMENT_NODE) continue;
+        if (node.matches('[role="article"]') || node.querySelector('[role="article"]')) {
+          pendingInjectionRoots.add(node);
+        }
+      }
+    }
+    if (pendingInjectionRoots.size === 0 || injectionTimer !== null) return;
+    injectionTimer = setTimeout(() => {
+      injectionTimer = null;
+      for (const root of pendingInjectionRoots) {
+        if (root.isConnected) injectScrapeButtons(root);
+      }
+      pendingInjectionRoots.clear();
+    }, 250);
+  });
+
+  injectScrapeButtons();
+  injectionObserver.observe(document.body || document.documentElement, { childList: true, subtree: true });
 
   // Helper sleep
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -399,38 +463,8 @@
 
   // Helper to check if two Facebook links refer to the same profile
   function isSameProfileLink(url1, url2) {
-    if (!url1 || !url2) return false;
-    try {
-      const u1 = new URL(url1, window.location.origin);
-      const u2 = new URL(url2, window.location.origin);
-      
-      if (u1.pathname.includes('profile.php') && u2.pathname.includes('profile.php')) {
-        return u1.searchParams.get('id') === u2.searchParams.get('id');
-      }
-      
-      const getUserIdFromGroupPath = (path) => {
-        const parts = path.split('/').filter(Boolean);
-        const userIdx = parts.indexOf('user');
-        if (userIdx !== -1 && userIdx + 1 < parts.length) {
-          return parts[userIdx + 1];
-        }
-        return null;
-      };
-      
-      const g1 = getUserIdFromGroupPath(u1.pathname);
-      const g2 = getUserIdFromGroupPath(u2.pathname);
-      if (g1 && g2) {
-        return g1 === g2;
-      }
-      
-      const p1 = u1.pathname.split('/').filter(Boolean)[0] || '';
-      const p2 = u2.pathname.split('/').filter(Boolean)[0] || '';
-      return p1 && p1 === p2;
-    } catch (e) {
-      const clean1 = url1.split('?')[0].split('#')[0];
-      const clean2 = url2.split('?')[0].split('#')[0];
-      return clean1 === clean2;
-    }
+    const key1 = getFacebookProfileKey(url1);
+    return !!key1 && key1 === getFacebookProfileKey(url2);
   }
 
   // Helper to recursively check if element or its children are bold
@@ -532,23 +566,25 @@
       return;
     }
     
+    const findAllCommentsOption = () => {
+      const menuOptions = Array.from(document.querySelectorAll('[role="menuitem"], [role="checkbox"], span, div, a'));
+      return menuOptions.find(el => {
+        const t = el.innerText ? el.innerText.trim() : '';
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0 && /All comments|ความคิดเห็นทั้งหมด/i.test(t);
+      });
+    };
+
     sendLog(`พบตัวกรองปัจจุบัน: "${filterBtn.innerText.trim()}" - กำลังสลับเป็น "ความคิดเห็นทั้งหมด" เพื่อดึงข้อมูลครบถ้วน...`);
+    const menuOptionReady = waitForCondition(document.documentElement, findAllCommentsOption, 2500);
     filterBtn.click();
-    await sleep(1500); // Wait for dropdown menu to appear
-    
-    // Look for "All comments" or "ความคิดเห็นทั้งหมด" option
-    const menuOptions = Array.from(document.querySelectorAll('[role="menuitem"], [role="checkbox"], span, div, a'));
-    const allCommentsOpt = menuOptions.find(el => {
-      const t = el.innerText ? el.innerText.trim() : '';
-      const rect = el.getBoundingClientRect();
-      const isVisible = rect.width > 0 && rect.height > 0;
-      return isVisible && /All comments|ความคิดเห็นทั้งหมด/i.test(t);
-    });
+    const allCommentsOpt = await menuOptionReady;
     
     if (allCommentsOpt) {
       sendLog(`คลิกเลือก: "${allCommentsOpt.innerText.trim()}"`);
+      const commentsChanged = waitForDomChange(searchRoot, 4000);
       allCommentsOpt.click();
-      await sleep(3000); // Wait for Facebook to reload the comments list
+      await commentsChanged;
     } else {
       sendLog("ไม่พบตัวเลือก 'ความคิดเห็นทั้งหมด' ในเมนู");
     }
@@ -556,11 +592,13 @@
 
   // Open comments section if collapsed
   async function openCommentsSection(postElement, searchRoot) {
-    // Check if comments section is already visible in searchRoot (contains any reply button)
-    const hasRepliesVisible = Array.from(searchRoot.querySelectorAll('span, div, a')).some(el => {
-      const t = el.innerText ? el.innerText.trim() : '';
-      return t === 'Reply' || t === 'ตอบกลับ';
+    const findReplyAction = () => Array.from(searchRoot.querySelectorAll('span, div, a')).find(el => {
+      const text = el.innerText ? el.innerText.trim() : '';
+      return text === 'Reply' || text === 'ตอบกลับ';
     });
+
+    // Check if comments section is already visible in searchRoot (contains any reply button)
+    const hasRepliesVisible = !!findReplyAction();
     
     if (hasRepliesVisible) {
       sendLog("ส่วนความคิดเห็นเปิดอยู่แล้ว ดำเนินการต่อ...");
@@ -581,31 +619,35 @@
 
     if (commentBtn) {
       sendLog(`คลิกปุ่ม: "${commentBtn.innerText ? commentBtn.innerText.trim() : 'แสดงความคิดเห็น'}"`);
+      const commentsReady = waitForCondition(searchRoot, findReplyAction, 4000);
       commentBtn.click();
-      await sleep(3000); // Wait for comments container to load/render
+      await commentsReady;
     } else {
       sendLog("ไม่พบปุ่มเปิดส่วนความคิดเห็นแบบมาตรฐาน จะลองคลิกสุ่มองค์ประกอบหรือโหลดคอมเมนต์ตรง...");
     }
   }
 
   // Helper to scroll comments container to the bottom to trigger lazy loading
-  function scrollCommentsToBottom(searchRoot) {
-    if (!searchRoot) return;
-    
+  function getCommentsScrollTargets(searchRoot) {
+    if (!searchRoot) return [];
     const dialog = searchRoot.getAttribute('role') === 'dialog' ? searchRoot : searchRoot.closest('[role="dialog"], [role="presentation"]');
-    
-    if (dialog) {
-      const divs = Array.from(dialog.querySelectorAll('div'));
-      const scrollables = divs.filter(el => {
-        const style = window.getComputedStyle(el);
-        return style.overflowY === 'auto' || style.overflowY === 'scroll';
+    if (!dialog) return [];
+
+    return Array.from(dialog.querySelectorAll('div')).filter(el => {
+      const style = window.getComputedStyle(el);
+      return style.overflowY === 'auto' || style.overflowY === 'scroll';
+    });
+  }
+
+  function scrollCommentsToBottom(searchRoot, scrollTargets) {
+    if (!searchRoot) return;
+
+    const connectedTargets = scrollTargets.filter(el => el.isConnected);
+    if (connectedTargets.length > 0) {
+      connectedTargets.forEach(el => {
+        el.scrollTop = el.scrollHeight;
       });
-      if (scrollables.length > 0) {
-        scrollables.forEach(el => {
-          el.scrollTop = el.scrollHeight;
-        });
-        return;
-      }
+      return;
     }
     
     window.scrollTo(0, document.body.scrollHeight);
@@ -614,16 +656,36 @@
     }
   }
 
+  function getVisibleCommentCounts(searchRoot, includeMainCount) {
+    const profileLinks = Array.from(searchRoot.querySelectorAll('a')).filter(a =>
+      isFacebookProfileLink(a) && isBoldElement(a)
+    );
+    if (!includeMainCount) return { all: profileLinks.length, main: 0 };
+
+    const offsets = [];
+    for (const link of profileLinks.slice(1)) {
+      const rect = link.getBoundingClientRect();
+      if (rect.width > 0 || rect.height > 0) offsets.push(rect.left);
+    }
+    return {
+      all: profileLinks.length,
+      main: countMainCommentsByOffsets(offsets)
+    };
+  }
+
   // Expand threads click simulator loop
   async function runExpandCommentsLoop(searchRoot, options) {
     const delay = options.delay || 2;
     const isExpandReplies = options.expandReplies;
+    const limit = Number(options.limit) || 0;
+    const scrollTargets = getCommentsScrollTargets(searchRoot);
     
     sendLog(`เริ่มกระบวนการขยายคอมเมนต์... (หน่วงเวลาคลิก ${delay} วินาที)`);
     
     let cycles = 0;
     let noNewDataAttempts = 0;
     let lastCommentsCount = 0;
+    let limitReached = false;
     
     while (!shouldStopScraping) {
       cycles++;
@@ -633,41 +695,37 @@
         break;
       }
 
-      // Scroll comments section to bottom to trigger infinite scroll or reveal lazy buttons
-      scrollCommentsToBottom(searchRoot);
-      await sleep(1500); // Wait for potential infinite scroll request to complete
+      let counts = getVisibleCommentCounts(searchRoot, limit > 0);
+      if (!limitReached && limit > 0 && counts.main >= limit) {
+        limitReached = true;
+        sendLog(`ถึงจำนวนคอมเมนต์หลักที่กำหนด ${limit} รายการ หยุดโหลดคอมเมนต์หลักเพิ่ม`);
+      }
+      if (limitReached && !isExpandReplies) break;
 
-      // Count current comments in DOM (using profile links count)
-      const currentLinks = Array.from(searchRoot.querySelectorAll('a'));
-      const profileLinks = currentLinks.filter(a => isFacebookProfileLink(a) && isBoldElement(a));
-      const currentCommentsCount = profileLinks.length;
+      // Observe before scrolling so fast Facebook updates cannot be missed.
+      if (!limitReached) {
+        const contentChanged = waitForDomChange(searchRoot, 1500);
+        scrollCommentsToBottom(searchRoot, scrollTargets);
+        await contentChanged;
+        counts = getVisibleCommentCounts(searchRoot, limit > 0);
+        if (limit > 0 && counts.main >= limit) {
+          limitReached = true;
+          sendLog(`ถึงจำนวนคอมเมนต์หลักที่กำหนด ${limit} รายการ หยุดโหลดคอมเมนต์หลักเพิ่ม`);
+          if (!isExpandReplies) break;
+        }
+      }
+
+      const currentCommentsCount = counts.all;
 
       const elements = Array.from(searchRoot.querySelectorAll('[role="button"], span, div, a'));
-      const expandButtons = elements.filter(el => {
-        if (clickedButtons.has(el) || el.dataset.scraperClicked === 'true') return false;
-        
-        const text = el.innerText ? el.innerText.trim() : '';
-        if (!text || text.length > 100) return false;
-        
-        const isCommentExpand = text.includes('View more comments') || 
-                                text.includes('View previous comments') ||
-                                text.includes('ดูความคิดเห็นเพิ่มเติม') ||
-                                text.includes('ดูความคิดเห็นก่อนหน้า');
-                                
-        const isReplyExpand = isExpandReplies && (
-          text.toLowerCase().includes('view reply') ||
-          text.toLowerCase().includes('view replies') ||
-          text.toLowerCase().includes('view previous replies') ||
-          text.includes('ดูการตอบกลับ') || 
-          text.includes('ดูการตอบกลับเพิ่มเติม') ||
-          /(reply|replies|ตอบกลับ).*?\d+|\d+.*?(reply|replies|ตอบกลับ)/i.test(text)
-        );
-        
-        const isCollapse = text.includes('Hide') || text.includes('ซ่อน') || text.includes('ซ่อนการตอบกลับ');
+      const expandButtons = findExpandCandidates(elements, {
+        expandReplies: isExpandReplies,
+        limitReached,
+        isClicked: el => buttonClickProgress.get(el) === currentCommentsCount,
+        isVisible: el => {
         const rect = el.getBoundingClientRect();
-        const isVisible = rect.width > 0 && rect.height > 0;
-        
-        return (isCommentExpand || isReplyExpand) && !isCollapse && isVisible;
+          return rect.width > 0 && rect.height > 0;
+        }
       });
 
       // Check if we loaded new data (comments count increased or we have buttons to click)
@@ -678,28 +736,38 @@
         noNewDataAttempts = 0; // Reset consecutive static attempts
       } else {
         noNewDataAttempts++;
-        if (noNewDataAttempts >= 4) { // Try up to 4 scrolls with no changes
+        const maxStaticAttempts = limitReached ? 2 : 4;
+        if (noNewDataAttempts >= maxStaticAttempts) {
           sendLog(`ขยายความคิดเห็นเสร็จสิ้น (พบความเห็นทั้งหมด ${currentCommentsCount} รายการ และไม่พบข้อมูลเพิ่มเติมหลังเลื่อนจอติดต่อกัน)`);
           break;
         }
-        sendLog(`ยังไม่พบข้อมูลใหม่ในรอบนี้ (พยายามเลื่อนจอซ้ำครั้งที่ ${noNewDataAttempts}/4)...`);
-        await sleep(1500);
+        sendLog(`ยังไม่พบข้อมูลใหม่ในรอบนี้ (พยายามซ้ำครั้งที่ ${noNewDataAttempts}/${maxStaticAttempts})...`);
+        await waitForDomChange(searchRoot, 1500);
         continue;
       }
 
       if (expandButtons.length > 0) {
         sendLog(`พบปุ่มกดขยายคอมเมนต์ ${expandButtons.length} ปุ่มในรอบที่ ${cycles} (ความเห็นในหน้าจอขณะนี้: ${currentCommentsCount} รายการ)`);
         
-        for (const btn of expandButtons) {
+        for (const { element: btn, type } of expandButtons) {
           if (shouldStopScraping) break;
+          if (!btn.isConnected) continue;
 
           btn.click();
-          clickedButtons.add(btn);
-          btn.dataset.scraperClicked = 'true';
+          buttonClickProgress.set(btn, currentCommentsCount);
           
           btn.scrollIntoView({ behavior: 'smooth', block: 'center' });
           sendLog(`คลิกขยาย: "${btn.innerText.trim()}"`);
           await sleep(delay * 1000);
+
+          if (type === 'comments' && limit > 0) {
+            counts = getVisibleCommentCounts(searchRoot, true);
+            if (counts.main >= limit) {
+              limitReached = true;
+              sendLog(`ถึงจำนวนคอมเมนต์หลักที่กำหนด ${limit} รายการ หยุดโหลดคอมเมนต์หลักเพิ่ม`);
+              break;
+            }
+          }
         }
       }
     }
@@ -722,11 +790,9 @@
   }
 
   // Run Scraper Engine Core logic
-  async function startScrapingWorkflow(options) {
-    isScraping = true;
-    shouldStopScraping = false;
+  async function startScrapingWorkflow(options, runId) {
     scrapedComments = [];
-    clickedButtons.clear();
+    buttonClickProgress = new WeakMap();
 
     sendLog("=== เริ่มดึงข้อมูลคอมเมนต์ ===");
 
@@ -746,14 +812,17 @@
       parsePostComments(searchRoot, options);
 
       // Step 3: Complete callback
-      chrome.runtime.sendMessage({ action: 'scrapeComplete', comments: scrapedComments });
+      chrome.runtime.sendMessage({ action: 'scrapeComplete', comments: scrapedComments, runId });
 
     } catch (e) {
       console.error(e);
       sendLog(`[ข้อผิดพลาด] การดึงข้อมูลติดขัด: ${e.message}`);
-      chrome.runtime.sendMessage({ action: 'scrapeFailed', error: e.message });
+      chrome.runtime.sendMessage({ action: 'scrapeFailed', error: e.message, runId });
     } finally {
-      isScraping = false;
+      if (activeRunId === runId) {
+        isScraping = false;
+        activeRunId = null;
+      }
     }
   }
 
@@ -766,6 +835,14 @@
     // Find all bold profile links in the post container
     const allLinks = Array.from(searchRoot.querySelectorAll('a'));
     const profileLinks = allLinks.filter(a => isFacebookProfileLink(a) && isBoldElement(a));
+    const avatarByProfileKey = new Map();
+    for (const link of allLinks) {
+      const key = getFacebookProfileKey(link.getAttribute('href'));
+      const image = key ? link.querySelector('img, image') : null;
+      if (!image || avatarByProfileKey.has(key)) continue;
+      const source = image.getAttribute('xlink:href') || image.getAttribute('href') || image.src || image.getAttribute('src') || image.getAttribute('data-src') || '';
+      if (source) avatarByProfileKey.set(key, source);
+    }
     
     sendLog(`พบลิงก์ HTML ทั้งหมด ${allLinks.length} รายการ (เป็นลิงก์ profile ตัวหนา ${profileLinks.length} รายการ)`);
 
@@ -799,9 +876,13 @@
         const candidates = Array.from(bodyContainer.querySelectorAll('div, span, [dir="auto"]'));
         
         // Filter elements to find potential comment text containers
-        const textCandidates = candidates.filter(el => {
+        let bestDirAutoCandidate = null;
+        let bestDirAutoLength = -1;
+        let bestOtherCandidate = null;
+        let bestOtherLength = -1;
+        for (const el of candidates) {
           // 1. Must not contain the name link or name text
-          if (el.contains(nameLink) || el === nameLink) return false;
+          if (el.contains(nameLink) || el === nameLink) continue;
           
           // 2. Must not be or contain action links (Like, Reply, timestamp, etc.)
           const hasActionLinks = Array.from(el.querySelectorAll('a, span[role="button"]')).some(subEl => {
@@ -809,23 +890,23 @@
             const href = subEl.getAttribute('href') || '';
             return t === 'Reply' || t === 'ตอบกลับ' || t === 'Like' || t === 'ถูกใจ' || href.includes('comment_id=');
           });
-          if (hasActionLinks) return false;
+          if (hasActionLinks) continue;
           
           const t = el.innerText ? el.innerText.trim() : '';
           // 3. Must not be empty or equal to name or actions
-          if (!t || t === name || t === 'Reply' || t === 'ตอบกลับ' || t === 'Like' || t === 'ถูกใจ') return false;
-          
-          return true;
-        });
+          if (!t || t === name || t === 'Reply' || t === 'ตอบกลับ' || t === 'Like' || t === 'ถูกใจ') continue;
 
-        // Pick the best candidate (longest dir="auto", or longest overall text candidate)
-        const dirAutoCandidates = textCandidates.filter(el => el.getAttribute('dir') === 'auto');
-        let bestCandidate = null;
-        if (dirAutoCandidates.length > 0) {
-          bestCandidate = dirAutoCandidates.sort((a, b) => b.innerText.length - a.innerText.length)[0];
-        } else if (textCandidates.length > 0) {
-          bestCandidate = textCandidates.sort((a, b) => b.innerText.length - a.innerText.length)[0];
+          if (el.getAttribute('dir') === 'auto') {
+            if (t.length > bestDirAutoLength) {
+              bestDirAutoLength = t.length;
+              bestDirAutoCandidate = el;
+            }
+          } else if (t.length > bestOtherLength) {
+            bestOtherLength = t.length;
+            bestOtherCandidate = el;
+          }
         }
+        const bestCandidate = bestDirAutoCandidate || bestOtherCandidate;
         
         if (bestCandidate) {
           text = bestCandidate.innerText.trim();
@@ -914,17 +995,9 @@
             }
           }
           
-          // 2. Fallback: Search inside the entire searchRoot for a profile link containing an img/image
+          // 2. Fallback: Use pre-indexed avatars from the entire search root.
           if (!avatar && searchRoot) {
-            const links = Array.from(searchRoot.querySelectorAll('a'));
-            const avatarLink = links.find(l => {
-              const href = l.getAttribute('href') || '';
-              return href && isSameProfileLink(targetHref, href) && l.querySelector('img, image');
-            });
-            if (avatarLink) {
-              const img = avatarLink.querySelector('img, image');
-              avatar = img.getAttribute('xlink:href') || img.getAttribute('href') || img.src || img.getAttribute('src') || img.getAttribute('data-src') || '';
-            }
+            avatar = avatarByProfileKey.get(getFacebookProfileKey(targetHref)) || '';
           }
         }
         
@@ -997,6 +1070,7 @@
     if (limit > 0) {
       let mainCommentCount = 0;
       const limited = [];
+      const includedIds = new Set();
       for (const item of finalData) {
         if (item.type === 'Comment') {
           mainCommentCount++;
@@ -1005,16 +1079,15 @@
           break;
         }
         if (item.type === 'Reply') {
-          const parentIncluded = limited.some(p => p.id === item.parentId);
-          if (!parentIncluded) continue;
+          if (!includedIds.has(item.parentId)) continue;
         }
         limited.push(item);
+        includedIds.add(item.id);
       }
       filteredData = limited;
     }
 
     scrapedComments = filteredData;
-    sendPreviewUpdate();
   }
 
   // Initialize auto detect on load

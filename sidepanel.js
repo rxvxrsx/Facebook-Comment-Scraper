@@ -7,6 +7,7 @@ let isScraping = false;
 let hasSelectedPost = false;
 let scrapedComments = [];
 let totalCommentsCount = 0;
+const MAX_PREVIEW_COMMENTS = 200;
 
 // DOM References
 const pageStatusDot = document.getElementById('page-status-dot');
@@ -124,7 +125,11 @@ document.addEventListener('DOMContentLoaded', async () => {
   });
   
   chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
-    if (tabId === activeTabId && changeInfo.status === 'complete') {
+    if (!tab.active) return;
+    if (tabId === activeTabId && (changeInfo.status === 'loading' || changeInfo.url)) {
+      resetForTabChange(tabId);
+    }
+    if (changeInfo.status === 'complete') {
       await checkCurrentTab();
     }
   });
@@ -171,7 +176,10 @@ async function checkCurrentTab() {
           }
           if (response && response.hasSelected) {
             updatePostSelectedState(true, response.message || 'ตรวจพบโพสต์อัตโนมัติ');
-            if (response.autoStart) {
+            if (response.isScraping && response.runId) {
+              restoreScrapingState(queriedTabId, response.runId);
+              addLog("เชื่อมต่อกลับเข้าการดึงข้อมูลที่กำลังทำงาน...");
+            } else if (response.autoStart) {
               addLog("เริ่มดึงข้อมูลอัตโนมัติ...");
               startScraping();
             }
@@ -274,6 +282,21 @@ function updatePostSelectedState(hasSelected, text, totalComments = 0) {
   }
 }
 
+function restoreScrapingState(tabId, runId) {
+  isScraping = true;
+  scrapeTabId = tabId;
+  currentRunId = runId;
+  btnStart.disabled = true;
+  btnStop.disabled = false;
+  btnSelectPost.disabled = true;
+  btnExportCsv.disabled = true;
+  btnExportJson.disabled = true;
+  setOptionsDisabled(true);
+  scrapingIndicator.textContent = 'กำลังดึงข้อมูล...';
+  scrapingIndicator.style.color = 'var(--warning)';
+  showPreviewMessage('กำลังรอข้อมูลดิบจากสคริปต์หน้าเพจ...');
+}
+
 // Message Listener from content script
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // Verify message is from the active tab
@@ -362,6 +385,7 @@ function startScraping() {
     if (chrome.runtime.lastError || !response || response.success !== true) {
       const error = chrome.runtime.lastError?.message || response?.error || 'content script ไม่ตอบกลับ';
       finishScrapingState('failed');
+      if (response?.selectionInvalid) updatePostSelectedState(false);
       addLog(`[ผิดพลาด] เริ่มดึงข้อมูลไม่ได้: ${error}`);
     }
   });
@@ -420,7 +444,8 @@ function updateLivePreview(comments) {
     return;
   }
 
-  comments.forEach(comment => {
+  const fragment = document.createDocumentFragment();
+  comments.slice(0, MAX_PREVIEW_COMMENTS).forEach(comment => {
     const card = document.createElement('div');
     card.className = `comment-card ${comment.type === 'Reply' ? 'reply' : ''}`;
 
@@ -430,6 +455,8 @@ function updateLivePreview(comments) {
     const avatar = document.createElement('img');
     avatar.className = 'comment-avatar';
     avatar.alt = 'avatar';
+    avatar.loading = 'lazy';
+    avatar.decoding = 'async';
     const defaultAvatar = 'data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%2224%22 height=%2224%22 viewBox=%220 0 24 24%22%3E%3Crect width=%2224%22 height=%2224%22 fill=%22%23475569%22/%3E%3C/svg%3E';
     avatar.src = normalizeExternalUrl(comment.avatar) || defaultAvatar;
 
@@ -459,6 +486,8 @@ function updateLivePreview(comments) {
       attachment.className = 'comment-attachment';
       attachment.src = imageUrl;
       attachment.alt = 'ภาพแนบ';
+      attachment.loading = 'lazy';
+      attachment.decoding = 'async';
       attachment.title = 'เปิดหน้าต่างใหม่เพื่อดูรูปใหญ่';
       const photoUrl = normalizeExternalUrl(comment.photoUrl) || normalizeExternalUrl(comment.imageUrl);
       if (photoUrl) {
@@ -469,8 +498,15 @@ function updateLivePreview(comments) {
       card.appendChild(attachment);
     }
 
-    previewList.appendChild(card);
+    fragment.appendChild(card);
   });
+  if (comments.length > MAX_PREVIEW_COMMENTS) {
+    const notice = document.createElement('div');
+    notice.className = 'preview-empty';
+    notice.textContent = `แสดงตัวอย่าง ${MAX_PREVIEW_COMMENTS} จาก ${comments.length} รายการ — ข้อมูลส่งออกยังครบทั้งหมด`;
+    fragment.appendChild(notice);
+  }
+  previewList.appendChild(fragment);
 }
 
 // Export CSV
@@ -544,9 +580,10 @@ function exportJson() {
   }));
 
   const replies = scrapedComments.filter(c => c.type === 'Reply');
+  const mainCommentsById = new Map(mainComments.map(comment => [comment.id, comment]));
   
   replies.forEach(r => {
-    const parent = mainComments.find(m => m.id === r.parentId);
+    const parent = mainCommentsById.get(r.parentId);
     if (parent) {
       parent.replies.push({
         id: r.id,
