@@ -22,7 +22,16 @@ test('post IDs survive feed-to-permalink navigation', () => {
     '977714681930758'
   );
   assert.equal(getFacebookPostId('/groups/948531731515720/posts/977714681930758'), '977714681930758');
+  assert.equal(
+    getFacebookPostId('https://www.facebook.com/groups/thaidev/permalink/1824909624975226/'),
+    '1824909624975226'
+  );
+  assert.equal(getFacebookPostId('/groups/thaidev/posts/1824909624975226'), '1824909624975226');
   assert.equal(getFacebookPostId('/permalink.php?story_fbid=977714681930758&id=123'), '977714681930758');
+  assert.equal(getFacebookPostId('https://www.facebook.com/reel/1517200353204935/'), '1517200353204935');
+  assert.equal(getFacebookPostId('https://www.facebook.com/reels/1517200353204935/'), '1517200353204935');
+  assert.equal(getFacebookPostId('https://www.facebook.com/watch/?v=1517200353204935'), '1517200353204935');
+  assert.equal(getFacebookPostId('https://www.facebook.com/video.php?v=1517200353204935'), '1517200353204935');
 });
 
 test('scrape options normalize inline and Side Panel settings consistently', () => {

@@ -7,6 +7,7 @@
   }
 })(typeof globalThis !== 'undefined' ? globalThis : this, function() {
   const SCRAPE_OPTIONS_STORAGE_KEY = 'fbScraperOptions';
+  const INLINE_BUTTON_ENABLED_STORAGE_KEY = 'fbScraperInlineButtonEnabled';
   const DEFAULT_SCRAPE_OPTIONS = Object.freeze({
     expandReplies: true,
     includeImages: true,
@@ -61,7 +62,7 @@
     try {
       const url = new URL(value, origin);
       const parts = url.pathname.split('/').filter(Boolean);
-      for (const segment of ['permalink', 'posts', 'videos']) {
+      for (const segment of ['permalink', 'posts', 'videos', 'reel', 'reels']) {
         const index = parts.indexOf(segment);
         if (index !== -1 && /^\d+$/.test(parts[index + 1] || '')) {
           return parts[index + 1];
@@ -70,6 +71,10 @@
 
       for (const parameter of ['story_fbid', 'fbid', 'video_id']) {
         const id = url.searchParams.get(parameter);
+        if (/^\d+$/.test(id || '')) return id;
+      }
+      if (parts[0] === 'watch' || parts[0] === 'video.php') {
+        const id = url.searchParams.get('v');
         if (/^\d+$/.test(id || '')) return id;
       }
     } catch (error) {
@@ -196,6 +201,7 @@
 
   return {
     DEFAULT_SCRAPE_OPTIONS,
+    INLINE_BUTTON_ENABLED_STORAGE_KEY,
     SCRAPE_OPTIONS_STORAGE_KEY,
     classifyExpandControlText,
     countMainCommentsByOffsets,

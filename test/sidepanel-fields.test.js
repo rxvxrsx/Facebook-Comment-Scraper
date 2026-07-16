@@ -47,3 +47,10 @@ test('Live Preview exposes a disabled lock until results exist', () => {
   assert.equal(button.getAttribute('aria-pressed'), 'false');
   assert.equal(button.disabled, true);
 });
+
+test('Side Panel exposes an enabled inline scrape button toggle', () => {
+  const document = loadSidePanel();
+  const toggle = document.getElementById('opt-inline-button');
+  assert.equal(toggle.type, 'checkbox');
+  assert.equal(toggle.checked, true);
+});

@@ -20,3 +20,15 @@ test('inline scrape resumes automatically after Facebook opens a permalink', () 
   assert.match(contentScript, /action: 'getQueuedInlineScrape'/);
   assert.match(contentScript, /void resumeQueuedInlineScrape\(\)/);
 });
+
+test('Reel pages receive a floating scrape button bound to their comment container', () => {
+  assert.match(contentScript, /inlineButtonTargets\.set\(btn, post\)/);
+  assert.match(contentScript, /btn\.dataset\.floating = isReelPage \? 'true' : 'false'/);
+  assert.match(contentScript, /btn\.style\.position = isReelPage \? 'fixed' : 'absolute'/);
+});
+
+test('inline scrape buttons can be enabled or removed at runtime', () => {
+  assert.match(contentScript, /case 'setInlineButtonEnabled':/);
+  assert.match(contentScript, /if \(!inlineButtonEnabled\) return;/);
+  assert.match(contentScript, /document\.querySelectorAll\(INLINE_BUTTON_SELECTOR\)/);
+});

@@ -8,6 +8,7 @@ const {
   normalizeFieldKeys
 } = globalThis.FbExportCore;
 const {
+  INLINE_BUTTON_ENABLED_STORAGE_KEY,
   SCRAPE_OPTIONS_STORAGE_KEY,
   normalizeScrapeOptions
 } = globalThis.FbScraperCore;
@@ -41,6 +42,7 @@ const statComments = document.getElementById('stat-comments');
 const statImages = document.getElementById('stat-images');
 
 // Options
+const optInlineButton = document.getElementById('opt-inline-button');
 const optExpand = document.getElementById('opt-expand');
 const optImages = document.getElementById('opt-images');
 const optLimit = document.getElementById('opt-limit');
@@ -122,6 +124,33 @@ async function restoreScrapeOptions() {
     applyScrapeOptions(null);
     console.warn('Cannot restore scrape options:', error);
   }
+}
+
+async function restoreInlineButtonPreference() {
+  try {
+    const stored = await chrome.storage.local.get(INLINE_BUTTON_ENABLED_STORAGE_KEY);
+    optInlineButton.checked = stored[INLINE_BUTTON_ENABLED_STORAGE_KEY] !== false;
+  } catch (error) {
+    optInlineButton.checked = true;
+    console.warn('Cannot restore inline button preference:', error);
+  }
+}
+
+function updateInlineButtonPreference() {
+  const enabled = optInlineButton.checked;
+  chrome.storage.local.set({
+    [INLINE_BUTTON_ENABLED_STORAGE_KEY]: enabled
+  }).catch(error => console.warn('Cannot persist inline button preference:', error));
+
+  if (activeTabId !== null) {
+    chrome.tabs.sendMessage(activeTabId, {
+      action: 'setInlineButtonEnabled',
+      enabled
+    }, () => {
+      void chrome.runtime.lastError;
+    });
+  }
+  addLog(enabled ? 'เปิดปุ่มดึงความเห็นบน Facebook' : 'ซ่อนปุ่มดึงความเห็นบน Facebook');
 }
 
 function persistScrapeOptions() {
@@ -233,7 +262,7 @@ function resetForTabChange(nextTabId) {
 // Initial connection check
 document.addEventListener('DOMContentLoaded', async () => {
   restoreExportFieldSelection();
-  await restoreScrapeOptions();
+  await Promise.all([restoreScrapeOptions(), restoreInlineButtonPreference()]);
   addLog("ส่วนควบคุม Side Panel เริ่มทำงาน...");
   await checkCurrentTab();
   
@@ -260,6 +289,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   btnExportJson.addEventListener('click', exportJson);
   btnClearLog.addEventListener('click', clearLog);
   btnLockPreview.addEventListener('click', () => setPreviewLocked(!isPreviewLocked));
+  optInlineButton.addEventListener('change', updateInlineButtonPreference);
   btnToggleFields.addEventListener('click', () => {
     setExportFieldsExpanded(btnToggleFields.getAttribute('aria-expanded') !== 'true');
   });

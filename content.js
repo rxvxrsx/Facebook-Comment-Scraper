@@ -3,6 +3,7 @@
 (function() {
   const {
     DEFAULT_SCRAPE_OPTIONS,
+    INLINE_BUTTON_ENABLED_STORAGE_KEY,
     SCRAPE_OPTIONS_STORAGE_KEY,
     countMainCommentsByOffsets,
     findExpandCandidates,
@@ -30,7 +31,9 @@
   let scrapedComments = [];
   let activeRunId = null;
   let activeInlineButton = null;
+  const inlineButtonTargets = new WeakMap();
   const INLINE_BUTTON_SELECTOR = '.fb-scraper-inline-btn';
+  let inlineButtonEnabled = false;
   let lastObservedUrl = window.location.href;
   let pendingResumeInFlight = false;
 
@@ -89,9 +92,60 @@
     activeInlineButton = null;
   }
 
+  function removeInlineButtons() {
+    document.querySelectorAll(INLINE_BUTTON_SELECTOR).forEach(button => button.remove());
+    if (!activeInlineButton?.isConnected) activeInlineButton = null;
+  }
+
+  function setInlineButtonEnabled(enabled) {
+    inlineButtonEnabled = enabled !== false;
+    if (inlineButtonEnabled) {
+      injectScrapeButtons(document);
+    } else {
+      removeInlineButtons();
+    }
+  }
+
+  async function restoreInlineButtonPreference() {
+    try {
+      const stored = await chrome.storage.local.get(INLINE_BUTTON_ENABLED_STORAGE_KEY);
+      setInlineButtonEnabled(stored[INLINE_BUTTON_ENABLED_STORAGE_KEY] !== false);
+    } catch (error) {
+      console.warn('Cannot restore inline button preference:', error);
+      setInlineButtonEnabled(true);
+    }
+  }
+
   function isSinglePostUrl(value = window.location.href) {
     return value.includes('/posts/') || value.includes('/permalink.php') ||
-      value.includes('/permalink/') || value.includes('/photos/') || value.includes('/videos/');
+      value.includes('/permalink/') || value.includes('/photos/') || value.includes('/videos/') ||
+      value.includes('/reel/') || value.includes('/reels/') || value.includes('/watch/') ||
+      value.includes('/story.php') || value.includes('/photo.php') || value.includes('/video.php') ||
+      value.includes('/share/p/') || value.includes('/share/r/') || value.includes('/share/v/');
+  }
+
+  function isReelPostUrl(value = window.location.href) {
+    return value.includes('/reel/') || value.includes('/reels/') || value.includes('/watch/') ||
+      value.includes('/share/r/') || value.includes('/share/v/');
+  }
+
+  function findPrimarySinglePostElement() {
+    if (!isSinglePostUrl()) return null;
+    let candidates = Array.from(document.querySelectorAll('[role="article"]')).filter(article =>
+      !article.parentElement?.closest('[role="article"]') && article.getAttribute('aria-hidden') !== 'true'
+    );
+    if (candidates.length === 0 && isReelPostUrl()) {
+      const dialogs = Array.from(document.querySelectorAll('[role="dialog"]')).filter(dialog =>
+        dialog.getAttribute('aria-hidden') !== 'true'
+      );
+      const main = document.querySelector('[role="main"]');
+      candidates = dialogs.length > 0 ? dialogs : (main ? [main] : []);
+    }
+    return candidates.reduce((largest, candidate) => {
+      const candidateLength = candidate.textContent?.length || 0;
+      const largestLength = largest?.textContent?.length || 0;
+      return !largest || candidateLength > largestLength ? candidate : largest;
+    }, null);
   }
 
   function findPostId(post) {
@@ -123,7 +177,7 @@
   }
 
   async function startInlineScraping(btn) {
-    const post = btn.closest('[role="article"]');
+    const post = inlineButtonTargets.get(btn) || btn.closest('[role="article"]');
     if (!post?.isConnected) return;
 
     queueInlineScrapeHandoff(post);
@@ -235,29 +289,16 @@
       shouldStopScraping = true;
     }
     selectedPostElement = null;
+    removeInlineButtons();
+    setTimeout(() => injectScrapeButtons(document), 0);
     if (!isScraping) void resumeQueuedInlineScrape();
   }
 
   // Check and auto-detect post if on single post pages
   function autoDetectPost() {
-    const url = window.location.href;
-    const isSinglePostPage = isSinglePostUrl(url);
-    
-    if (isSinglePostPage) {
-      const articles = Array.from(document.querySelectorAll('[role="article"]')).filter(article =>
-        !article.parentElement?.closest('[role="article"]')
-      );
-      if (articles.length > 0) {
-        let mainArticle = articles[0];
-        let largestTextLength = -1;
-        for (const article of articles) {
-          const textLength = article.textContent?.length || 0;
-          if (textLength > largestTextLength) {
-            largestTextLength = textLength;
-            mainArticle = article;
-          }
-        }
-        
+    if (isSinglePostUrl()) {
+      const mainArticle = findPrimarySinglePostElement();
+      if (mainArticle) {
         // Highlight post
         if (selectedPostElement) selectedPostElement.style.outline = '';
         selectedPostElement = mainArticle;
@@ -303,6 +344,11 @@
 
       case 'startScrape':
         sendResponse(beginScraping(message.options, message.runId));
+        break;
+
+      case 'setInlineButtonEnabled':
+        setInlineButtonEnabled(message.enabled);
+        sendResponse({ success: true, enabled: inlineButtonEnabled });
         break;
 
       case 'stopScrape':
@@ -386,38 +432,47 @@
 
   // Inject "Scrape" shortcut button directly on top of each Facebook post container
   function injectScrapeButtons(root = document) {
+    if (!inlineButtonEnabled) return;
+    const isReelPage = isReelPostUrl();
     const articles = [];
-    if (root instanceof Element && root.matches('[role="article"]')) {
+    if (!isReelPage && root instanceof Element && root.matches('[role="article"]')) {
       articles.push(root);
     }
-    if (root.querySelectorAll) {
+    if (!isReelPage && root.querySelectorAll) {
       articles.push(...root.querySelectorAll('[role="article"]'));
     }
-    const topLevelPosts = articles.filter(art => {
-      if (art.parentElement?.closest('[role="article"]')) return false;
-      
-      // Prevent injecting buttons in Messenger chat windows, sidebars, or message bubbles
-      const rect = art.getBoundingClientRect();
-      const isChat = art.closest('[role="complementary"]') || 
-                     art.closest('[aria-label="Chats"]') || 
-                     art.closest('[aria-label="แชท"]') ||
-                     art.closest('[role="grid"]') || 
-                     rect.width < 400; // Facebook posts are always >= 500px wide, chats are narrower
-      
-      return !isChat;
-    });
+    const topLevelPosts = isReelPage
+      ? [findPrimarySinglePostElement()].filter(Boolean)
+      : articles.filter(art => {
+          if (art.parentElement?.closest('[role="article"]')) return false;
+
+          // Prevent injecting buttons in Messenger chat windows, sidebars, or message bubbles
+          const rect = art.getBoundingClientRect();
+          const isChat = art.closest('[role="complementary"]') ||
+                         art.closest('[aria-label="Chats"]') ||
+                         art.closest('[aria-label="แชท"]') ||
+                         art.closest('[role="grid"]') ||
+                         rect.width < 400; // Facebook posts are always >= 500px wide, chats are narrower
+
+          return !isChat;
+        });
     
     topLevelPosts.forEach(post => {
-      if (post.querySelector('.fb-scraper-inline-btn')) return;
+      const existingButton = isReelPage
+        ? document.querySelector(`${INLINE_BUTTON_SELECTOR}[data-floating="true"]`)
+        : post.querySelector(INLINE_BUTTON_SELECTOR);
+      if (existingButton) return;
       
       const btn = document.createElement('button');
       btn.type = 'button';
       btn.className = 'fb-scraper-inline-btn';
+      btn.dataset.floating = isReelPage ? 'true' : 'false';
       btn.innerText = '📊 ดึงความเห็น';
+      inlineButtonTargets.set(btn, post);
       
-      btn.style.position = 'absolute';
-      btn.style.top = '12px';
-      btn.style.right = '60px'; // Offset to avoid blocking the three-dots menu
+      btn.style.position = isReelPage ? 'fixed' : 'absolute';
+      btn.style.top = isReelPage ? '72px' : '12px';
+      btn.style.right = isReelPage ? '24px' : '60px';
       btn.style.background = 'linear-gradient(135deg, #4f46e5, #06b6d4)';
       btn.style.border = 'none';
       btn.style.color = '#ffffff';
@@ -427,7 +482,7 @@
       btn.style.fontWeight = 'bold';
       btn.style.fontFamily = 'inherit';
       btn.style.cursor = 'pointer';
-      btn.style.zIndex = '999';
+      btn.style.zIndex = isReelPage ? '2147483647' : '999';
       btn.style.boxShadow = '0 2px 5px rgba(0,0,0,0.2)';
       btn.style.transition = 'all 0.2s ease-in-out';
       btn.style.userSelect = 'none';
@@ -441,12 +496,15 @@
         btn.style.background = 'linear-gradient(135deg, #4f46e5, #06b6d4)';
       });
       
-      const style = window.getComputedStyle(post);
-      if (style.position === 'static') {
-        post.style.position = 'relative';
+      if (isReelPage) {
+        (document.body || document.documentElement).appendChild(btn);
+      } else {
+        const style = window.getComputedStyle(post);
+        if (style.position === 'static') {
+          post.style.position = 'relative';
+        }
+        post.appendChild(btn);
       }
-      
-      post.appendChild(btn);
     });
   }
 
@@ -455,6 +513,10 @@
   let injectionTimer = null;
   const injectionObserver = new MutationObserver(mutations => {
     checkForFacebookRouteChange();
+    if (!inlineButtonEnabled) return;
+    const needsReelButton = isReelPostUrl() &&
+      !document.querySelector(`${INLINE_BUTTON_SELECTOR}[data-floating="true"]`);
+    if (needsReelButton) pendingInjectionRoots.add(document);
     for (const mutation of mutations) {
       for (const node of mutation.addedNodes) {
         if (node.nodeType !== Node.ELEMENT_NODE) continue;
@@ -473,7 +535,7 @@
     }, 250);
   });
 
-  injectScrapeButtons();
+  void restoreInlineButtonPreference();
   injectionObserver.observe(document.body || document.documentElement, { childList: true, subtree: true });
 
   // Helper sleep
@@ -640,6 +702,9 @@
         href.includes('/photo') || 
         href.includes('/permalink') || 
         href.includes('/videos/') ||
+        href.includes('/reel/') ||
+        href.includes('/reels/') ||
+        href.includes('/watch/') ||
         href.includes('/sharer.php') ||
         href.includes('/ads/') ||
         href.includes('/pages/') ||
